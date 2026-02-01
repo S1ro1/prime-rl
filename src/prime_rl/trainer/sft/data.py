@@ -664,16 +664,34 @@ def setup_validation_dataloader(
 ) -> StatefulDataLoader:
     """Set up a validation dataloader using the same dataset but with the validation split."""
     logger = get_logger()
-    logger.info(
-        f"Setting up validation dataloader (split={validation_config.split}, max_samples={validation_config.max_samples})"
-    )
 
-    # Load the validation split
+    if validation_config.subsets is None and validation_config.splits is None:
+        logger.info(
+            f"Setting up validation dataloader (split={validation_config.split}, max_samples={validation_config.max_samples})"
+        )
+        subsets_and_splits: list[tuple[str | None, str]] = [(None, validation_config.split)]
+    elif validation_config.subsets is not None and validation_config.splits is None:
+        logger.info(
+            f"Setting up validation dataloader with subsets {validation_config.subsets} (split={validation_config.split}, max_samples={validation_config.max_samples})"
+        )
+        subsets_and_splits = [(subset, validation_config.split) for subset in validation_config.subsets]
+    elif validation_config.subsets is None and validation_config.splits is not None:
+        logger.info(
+            f"Setting up validation dataloader with splits {validation_config.splits} (max_samples={validation_config.max_samples})"
+        )
+        subsets_and_splits = [(None, split) for split in validation_config.splits]
+    else:
+        assert validation_config.subsets is not None and validation_config.splits is not None
+        logger.info(
+            f"Setting up validation dataloader with subsets {validation_config.subsets} and splits {validation_config.splits} (max_samples={validation_config.max_samples})"
+        )
+        subsets_and_splits = list(zip(validation_config.subsets, validation_config.splits))
+
     dataset = setup_and_interleave_datasets(
         dataset_name=data_config.name,
-        subsets_and_splits=[(None, validation_config.split)],
-        probabilities=None,
-        stopping_strategy="all_exhausted",
+        subsets_and_splits=subsets_and_splits,
+        probabilities=validation_config.probabilities,
+        stopping_strategy=validation_config.stopping_strategy,
         seed=data_config.seed,
     )
 

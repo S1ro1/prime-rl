@@ -22,8 +22,44 @@ class ValidationConfig(BaseConfig):
 
     enabled: Annotated[bool, Field(description="Enable online validation during training.")] = False
     interval: Annotated[int, Field(ge=1, description="Run validation every N training steps.")] = 100
-    split: Annotated[str, Field(description="HuggingFace dataset split to use for validation.")] = "validation"
+    split: Annotated[str, Field(description="HuggingFace dataset split to use for validation (simple case).")] = (
+        "validation"
+    )
     max_samples: Annotated[int | None, Field(ge=1, description="Maximum number of validation samples to use.")] = None
+
+    subsets: Annotated[
+        list[str] | None, Field(description="Subsets to use from the HF dataset for validation interleaving.")
+    ] = None
+    splits: Annotated[
+        list[str] | None, Field(description="Splits to use from the HF dataset for validation interleaving.")
+    ] = None
+    probabilities: Annotated[
+        list[float] | None, Field(description="Probabilities to use for each subset/split during interleaving.")
+    ] = None
+    stopping_strategy: Annotated[
+        Literal["first_exhausted", "all_exhausted"],
+        Field(description="Strategy for handling datasets of different lengths during interleaving."),
+    ] = "all_exhausted"
+
+    @model_validator(mode="after")
+    def validate_subsets_and_splits(self):
+        if self.subsets is not None or self.splits is not None:
+            if self.subsets is not None and self.splits is not None:
+                if len(self.subsets) != len(self.splits):
+                    raise ValueError(
+                        "Number of subsets must be equal to number of splits. Please specify which split to load for each subset."
+                    )
+            if self.subsets is not None and self.probabilities is not None:
+                if len(self.probabilities) != len(self.subsets):
+                    raise ValueError(
+                        "Number of probabilities must be equal to number of subsets. Please specify a probability for each subset."
+                    )
+            if self.splits is not None and self.probabilities is not None:
+                if len(self.probabilities) != len(self.splits):
+                    raise ValueError(
+                        "Number of probabilities must be equal to number of splits. Please specify a probability for each split."
+                    )
+        return self
 
 
 class BaseDataConfig(BaseModel):
