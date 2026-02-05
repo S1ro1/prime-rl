@@ -53,6 +53,7 @@ from prime_rl.utils.pydantic_config import parse_argv
 from prime_rl.utils.temp_scheduling import compute_temperature
 from prime_rl.utils.utils import (
     clean_exit,
+    count_chinese_chars,
     get_env_ids_to_install,
     install_env,
     resolve_latest_ckpt_step,
@@ -67,7 +68,9 @@ from prime_rl.utils.vlm import is_vlm_model
 async def orchestrate(config: OrchestratorConfig):
     # Initialize the logger
     logger = setup_logger(
-        config.log.level, log_file=config.output_dir / "logs" / "orchestrator.log" if config.log.file else None
+        config.log.level,
+        log_file=config.output_dir / "logs" / "orchestrator.log" if config.log.file else None,
+        json_logging=config.log.json_logging,
     )
     intercept_verifiers_logging(level=config.log.vf_level)
     logger.info("Starting orchestrator")
@@ -121,6 +124,11 @@ async def orchestrate(config: OrchestratorConfig):
 
     processor = None
     if is_vlm:
+        if config.trajectory_strategy == "interleaved":
+            raise ValueError(
+                "Multimodal training does not support the interleaved trajectory strategy. "
+                "Set trajectory_strategy = 'branching' (see docs/multimodal.md)."
+            )
         logger.info(f"Loading VLM processor for {config.model.name}")
         processor = AutoProcessor.from_pretrained(
             config.model.name, trust_remote_code=config.model.trust_remote_code, use_fast=True
@@ -246,7 +254,10 @@ async def orchestrate(config: OrchestratorConfig):
 
         # In NCCL mode, skip existence check - weights are broadcasted, not stored on disk
         check_exists = config.weight_broadcast.type != "nccl"
-        weights_path = get_weight_dir(config.output_dir, scheduler.ckpt_step, check_exists=check_exists)
+        wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else None
+        weights_path = get_weight_dir(
+            config.output_dir, scheduler.ckpt_step, check_exists=check_exists, wait_timeout=wait_timeout
+        )
         lora_name = config.model.lora.name if config.model.lora else None
         await inference_pool.update_weights(weights_path, lora_name=lora_name, step=scheduler.ckpt_step)
     else:
@@ -338,6 +349,7 @@ async def orchestrate(config: OrchestratorConfig):
                 ckpt_step=ckpt_step,
                 step=progress.step,
                 max_concurrent=config.max_concurrent or -1,
+                json_logging=config.log.json_logging,
             )
 
             # Resume weight updates
@@ -382,29 +394,37 @@ async def orchestrate(config: OrchestratorConfig):
         )
 
         # Convert rollouts to training samples
-        rollout_fn = interleave_rollout if config.trajectory_strategy == "interleaved" else branch_rollout
         parallel_preprocess_start = time.perf_counter()
+
+        num_unique_examples = len({r["example_id"] for r in train_rollouts})
 
         # VLM: build image cache for efficient batched preprocessing
         if is_vlm:
             vlm_cache = build_vlm_image_cache(train_rollouts, processor)
-            num_unique = vlm_cache.num_unique_examples
             logger.info(
                 f"VLM timing: extract={vlm_cache.extract_time:.2f}s, preprocess={vlm_cache.preprocess_time:.2f}s"
             )
         else:
             vlm_cache = None
-            num_unique = len({r["example_id"] for r in train_rollouts})
 
         # Process rollouts in parallel
-        def process_rollout(rollout: vf.State) -> list[TrainingSample] | None:
-            if vlm_cache is not None:
-                cached = vlm_cache.get(rollout["example_id"])
-                return rollout_fn(rollout, cached_pixel_values=cached[0], cached_image_grid_thw=cached[1])
-            return rollout_fn(rollout)
+        if config.trajectory_strategy == "interleaved":
+
+            def process_rollout(rollout: vf.State) -> list[TrainingSample] | None:
+                return interleave_rollout(rollout)
+        else:
+
+            def process_rollout(rollout: vf.State, rollout_idx: int) -> list[TrainingSample] | None:
+                return branch_rollout(rollout, vlm_cache=vlm_cache, cache_key=rollout_idx)
 
         loop = asyncio.get_event_loop()
-        futures = [loop.run_in_executor(rollout_executor, process_rollout, r) for r in train_rollouts]
+        if config.trajectory_strategy == "interleaved":
+            futures = [loop.run_in_executor(rollout_executor, process_rollout, r) for r in train_rollouts]
+        else:
+            futures = [
+                loop.run_in_executor(rollout_executor, process_rollout, r, rollout_idx)
+                for rollout_idx, r in enumerate(train_rollouts)
+            ]
         results = await asyncio.gather(*futures)
 
         # Collect results and assign advantages
@@ -418,7 +438,7 @@ async def orchestrate(config: OrchestratorConfig):
 
         parallel_preprocess_time = time.perf_counter() - parallel_preprocess_start
         logger.debug(
-            f"Converted {len(train_rollouts)} rollouts ({num_unique} unique examples) "
+            f"Converted {len(train_rollouts)} rollouts ({num_unique_examples} unique examples) "
             f"to {len(train_examples)} training examples using {config.trajectory_strategy} strategy"
         )
 
@@ -487,11 +507,26 @@ async def orchestrate(config: OrchestratorConfig):
         # Gather individual reward function metrics
         metrics_df = pd.DataFrame([rollout["metrics"] for rollout in train_rollouts])
 
+        # Count Chinese characters in completions
+        chinese_stats = []
+        for rollout in train_rollouts:
+            trajectory = rollout["trajectory"]
+            if not trajectory:
+                continue
+            last_step = trajectory[-1]
+            tokens = last_step["tokens"]
+            completion_text = tokenizer.decode(tokens["completion_ids"])
+            chinese_count, total_count = count_chinese_chars(completion_text)
+            chinese_stats.append(
+                {"chinese_chars": chinese_count, "total_chars": total_count, "has_chinese": chinese_count > 0}
+            )
+        chinese_df = pd.DataFrame(chinese_stats)
+
         val_results_df = (
             pd.DataFrame(
                 {
-                    "example_id": [rollout["input"]["example_id"] for rollout in val_outputs],
-                    "task": [rollout["input"]["task"] for rollout in val_outputs],
+                    "example_id": [rollout["example_id"] for rollout in val_outputs],
+                    "task": [rollout["task"] for rollout in val_outputs],
                     "reward": [rollout["reward"] for rollout in val_outputs],
                 }
             )
@@ -566,6 +601,14 @@ async def orchestrate(config: OrchestratorConfig):
             },
             # Env metrics
             **{f"metrics/{metric}": metrics_df[metric].mean() for metric in metrics_df.columns},
+            # Chinese character metrics (cast to native Python types for JSON serialization)
+            "chinese/char_count": int(chinese_df.chinese_chars.sum()),
+            "chinese/char_ratio": (
+                float(chinese_df.chinese_chars.sum() / chinese_df.total_chars.sum())
+                if chinese_df.total_chars.sum() > 0
+                else 0.0
+            ),
+            "chinese/rollout_ratio": float(chinese_df.has_chinese.mean()),
             # Time metrics
             "time/step": step_time,
             "time/generate_completions": generate_completions_time,
@@ -642,6 +685,7 @@ async def orchestrate(config: OrchestratorConfig):
             ckpt_step=scheduler.ckpt_step,
             step=progress.step,
             max_concurrent=config.max_concurrent or -1,
+            json_logging=config.log.json_logging,
         )
 
     # Log final (immutable) samples and distributions to monitor(s)

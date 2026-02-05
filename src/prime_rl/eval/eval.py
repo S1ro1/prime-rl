@@ -2,7 +2,6 @@ import asyncio
 
 from prime_rl.eval.config import OfflineEvalConfig
 from prime_rl.eval.utils import run_evals
-from prime_rl.orchestrator.utils import set_semaphore
 from prime_rl.utils.client import (
     check_health,
     maybe_check_has_model,
@@ -22,7 +21,9 @@ from prime_rl.utils.utils import clean_exit, get_env_ids_to_install, get_step_pa
 async def eval(config: OfflineEvalConfig):
     # Initialize the logger
     logger = setup_logger(
-        config.log.level, log_file=config.output_dir / "logs" / "eval.log" if config.log.file else None
+        config.log.level,
+        log_file=config.output_dir / "logs" / "eval.log" if config.log.file else None,
+        json_logging=config.log.json_logging,
     )
     intercept_verifiers_logging(level=config.log.vf_level)
 
@@ -62,7 +63,6 @@ async def eval(config: OfflineEvalConfig):
     await reload_weights(admin_clients)
 
     # Run benchmarks on base model
-    await set_semaphore(config.max_concurrent or -1)
     if config.eval_base:
         logger.info(f"Evaluating model {config.model.name}")
         await run_evals(
